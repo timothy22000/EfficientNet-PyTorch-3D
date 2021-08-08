@@ -2,7 +2,12 @@ from efficientnet_pytorch_3d import EfficientNet3D
 import torch
 from torchsummary import summary
 
-device = 'cpu'
+
+print("Test")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+if device.type == 'cuda':
+    print(torch.cuda.get_device_name(0))
 
 model = EfficientNet3D.from_name("efficientnet-b0", override_params={'num_classes': 2}, in_channels=1)
 
