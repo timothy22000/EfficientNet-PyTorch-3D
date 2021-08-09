@@ -97,6 +97,162 @@ class MBConvBlock3D(nn.Module):
         self._swish = MemoryEfficientSwish() if memory_efficient else Swish()
 
 
+class MultiModalEfficientNet3D(nn.Module):
+    """
+    An EfficientNet model. Most easily loaded with the .from_name or .from_pretrained methods
+
+    Args:
+        blocks_args (list): A list of BlockArgs to construct blocks
+        global_params (namedtuple): A set of GlobalParams shared between blocks
+
+    Example:
+        model = EfficientNet3D.from_pretrained('efficientnet-b0')
+
+    """
+
+    def __init__(self, blocks_args=None, global_params=None, in_channels=3):
+        super().__init__()
+        assert isinstance(blocks_args, list), 'blocks_args should be a list'
+        assert len(blocks_args) > 0, 'block args must be greater than 0'
+        self._global_params = global_params
+        self._blocks_args = blocks_args
+
+        # Get static or dynamic convolution depending on image size
+        Conv3d = get_same_padding_conv3d(image_size=global_params.image_size)
+
+        # Batch norm parameters
+        bn_mom = 1 - self._global_params.batch_norm_momentum
+        bn_eps = self._global_params.batch_norm_epsilon
+
+        # Stem
+        out_channels = round_filters(32, self._global_params)  # number of output channels
+        self._conv_stem = Conv3d(in_channels, out_channels, kernel_size=3, stride=2, bias=False)
+        self._bn0 = nn.BatchNorm3d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
+        # Build blocks
+        self._blocks = nn.ModuleList([])
+        for block_args in self._blocks_args:
+
+            # Update block input and output filters based on depth multiplier.
+            block_args = block_args._replace(
+                input_filters=round_filters(block_args.input_filters, self._global_params),
+                output_filters=round_filters(block_args.output_filters, self._global_params),
+                num_repeat=round_repeats(block_args.num_repeat, self._global_params)
+            )
+
+            # The first block needs to take care of stride and filter size increase.
+            self._blocks.append(MBConvBlock3D(block_args, self._global_params))
+            if block_args.num_repeat > 1:
+                block_args = block_args._replace(input_filters=block_args.output_filters, stride=1)
+            for _ in range(block_args.num_repeat - 1):
+                self._blocks.append(MBConvBlock3D(block_args, self._global_params))
+
+        # Head
+        in_channels = block_args.output_filters  # output of final block
+        out_channels = round_filters(1280, self._global_params)
+        self._conv_head = Conv3d(in_channels, out_channels, kernel_size=1, bias=False)
+        self._bn1 = nn.BatchNorm3d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
+
+        # Final linear layer
+        self._avg_pooling = nn.AdaptiveAvgPool3d(1)
+        self._dropout = nn.Dropout(self._global_params.dropout_rate)
+        self._fc = nn.Linear(out_channels*4, self._global_params.num_classes)
+        self._fc_multi = nn.Linear(out_channels*4, self._global_params.num_classes)
+        self._swish = MemoryEfficientSwish()
+
+    def set_swish(self, memory_efficient=True):
+        """Sets swish function as memory efficient (for training) or standard (for export)"""
+        self._swish = MemoryEfficientSwish() if memory_efficient else Swish()
+        for block in self._blocks:
+            block.set_swish(memory_efficient)
+
+
+    def extract_features(self, inputs):
+        """ Returns output of the final convolution layer """
+
+        # Stem
+        x = self._swish(self._bn0(self._conv_stem(inputs)))
+
+        # Blocks
+        for idx, block in enumerate(self._blocks):
+            drop_connect_rate = self._global_params.drop_connect_rate
+            if drop_connect_rate:
+                drop_connect_rate *= float(idx) / len(self._blocks)
+            x = block(x, drop_connect_rate=drop_connect_rate)
+
+        # Head
+        x = self._swish(self._bn1(self._conv_head(x)))
+
+        return x
+
+    def forward(self, inputs1, inputs2, inputs3, inputs4):
+        """ Calls extract_features to extract features, applies final linear layer, and returns logits. """
+        # bs = inputs.size(0)
+        # # Convolution layers
+        # x = self.extract_features(inputs)
+        #
+        # if self._global_params.include_top:
+        #     # Pooling and final linear layer
+        #     x = self._avg_pooling(x)
+        #     x = x.view(bs, -1)
+        #     x = self._dropout(x)
+        #     x = self._fc(x)
+
+        batch_size1 = inputs1.size(0)
+        batch_size2 = inputs2.size(0)
+        batch_size3 = inputs3.size(0)
+        batch_size4 = inputs4.size(0)
+
+        x1 = self.extract_features(inputs1)
+        x2 = self.extract_features(inputs2)
+        x3 = self.extract_features(inputs3)
+        x4 = self.extract_features(inputs4)
+
+        x1 = self._avg_pooling(x1)
+        x1 = x1.view(batch_size1, -1)
+        # x1 = x1.view(-1, batch_size1)
+        print(x1.size())
+
+        x2 = self._avg_pooling(x2)
+        x2 = x2.view(batch_size2, -1)
+        # x2 = x2.view(-1, batch_size2)
+        print(x2.size())
+
+
+        x3 = self._avg_pooling(x3)
+        x3 = x3.view(batch_size3, -1)
+        # x3 = x3.view(-1, batch_size3)
+        print(x3.size())
+
+        x4 = self._avg_pooling(x4)
+        x4 = x4.view(batch_size4, -1)
+        # x4 = x4.view(-1, batch_size4)
+        print(x4.size())
+
+        combined_feature_map = torch.cat((x1,x2,x3,x4), 1)
+        print(combined_feature_map.size())
+        x = self._dropout(combined_feature_map)
+        x = self._fc(x)
+        return x
+
+    @classmethod
+    def from_name(cls, model_name, override_params=None, in_channels=3):
+        cls._check_model_name_is_valid(model_name)
+        blocks_args, global_params = get_model_params(model_name, override_params)
+        return cls(blocks_args, global_params, in_channels)
+
+    @classmethod
+    def get_image_size(cls, model_name):
+        cls._check_model_name_is_valid(model_name)
+        _, _, res, _ = efficientnet_params(model_name)
+        return res
+
+    @classmethod
+    def _check_model_name_is_valid(cls, model_name):
+        """ Validates model name. """ 
+        valid_models = ['efficientnet-b'+str(i) for i in range(9)]
+        if model_name not in valid_models:
+            raise ValueError('model_name should be one of: ' + ', '.join(valid_models))
+
 class EfficientNet3D(nn.Module):
     """
     An EfficientNet model. Most easily loaded with the .from_name or .from_pretrained methods
@@ -212,7 +368,7 @@ class EfficientNet3D(nn.Module):
 
     @classmethod
     def _check_model_name_is_valid(cls, model_name):
-        """ Validates model name. """ 
+        """ Validates model name. """
         valid_models = ['efficientnet-b'+str(i) for i in range(9)]
         if model_name not in valid_models:
             raise ValueError('model_name should be one of: ' + ', '.join(valid_models))
